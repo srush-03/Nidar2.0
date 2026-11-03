@@ -1,0 +1,6 @@
+   *.pt
+   runs/
+   logs/
+   dataset_raw/
+   *.cache
+   survivors_state.json

@@ -20,6 +20,8 @@ drops, and every new survivor is written to --state-file (use --resume after a r
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime
 import json
 import math
 import os
@@ -236,6 +238,7 @@ class SurvivorNode:
         self.n = 0
         self.warned = False
         self.warned_cap = False
+        self.t0 = time.monotonic()
 
     def step(self, frame, depth):
         """Process one frame. Returns [(x1, y1, x2, y2, label, confirmed)]."""
@@ -278,17 +281,21 @@ class SurvivorNode:
                     self.warned = True
                 s, is_new = self.reg.confirm(xy)
                 st["sid"] = s["id"]
-                if is_new:
-                    mean_c = sum(st["confs"][-a.confirm_frames:]) / a.confirm_frames
-                    self.emit({"event": "survivor", "id": s["id"], "grid": s["cell"],
-                               "xy_m": None if s["xy"] is None else
-                               [round(s["xy"][0], 2), round(s["xy"][1], 2)],
-                               "conf": round(mean_c, 2), "total": len(self.reg.survivors),
-                               "t": round(time.time(), 2)})
-                    if len(self.reg.survivors) > a.max_survivors and not self.warned_cap:
-                        print(f"WARNING: more than {a.max_survivors} survivors counted - "
-                              "check for false positives / duplicates")
-                        self.warned_cap = True
+                mean_c = sum(st["confs"][-a.confirm_frames:]) / a.confirm_frames
+                sig = {"event": "survivor" if is_new else "duplicate", "id": s["id"],
+                       "grid": s["cell"],
+                       "xy_m": None if s["xy"] is None else
+                       [round(s["xy"][0], 2), round(s["xy"][1], 2)],
+                       "conf": round(mean_c, 2), "total": len(self.reg.survivors),
+                       "time_iso": datetime.datetime.now().astimezone().isoformat(
+                           timespec="milliseconds"),
+                       "elapsed_s": round(time.monotonic() - self.t0, 2)}
+                self.emit(sig, frame, (x1, y1, x2, y2))
+                if (is_new and len(self.reg.survivors) > a.max_survivors
+                        and not self.warned_cap):
+                    print(f"WARNING: more than {a.max_survivors} survivors counted - "
+                          "check for false positives / duplicates")
+                    self.warned_cap = True
             label = f"S{st['sid']}" if st["sid"] else f"? {st['hits']}"
             out.append((x1, y1, x2, y2, label, st["sid"] is not None))
         return out
@@ -384,11 +391,15 @@ def selftest():
     depth6 = np.full((360, 640), 6000, np.uint16)
     signals = []
     node = SurvivorNode(args, _FakeModel(script), K, type("P", (), {"latest": lambda s: (0, 0, 0)})(),
-                        SurvivorRegistry(0.6, 1.0), signals.append)
+                        SurvivorRegistry(0.6, 1.0),
+                        lambda sig, fr, bx: signals.append(sig))
     for i in range(len(script)):
         dep = depth6 if 19 <= i < 27 else depth3
         node.step(frame, dep)
-    assert len(signals) == 2, signals
+    dups = [x for x in signals if x["event"] == "duplicate"]
+    signals = [x for x in signals if x["event"] == "survivor"]
+    assert len(signals) == 2 and len(dups) == 1, (signals, dups)
+    assert "T" in signals[0]["time_iso"] and signals[0]["elapsed_s"] >= 0
     assert signals[0]["grid"] == [3, 0] or tuple(signals[0]["grid"]) == (3, 0), signals[0]
     assert tuple(signals[1]["grid"]) == (6, 0), signals[1]
     assert len(node.reg.survivors) == 2
@@ -419,6 +430,7 @@ def parse_args(argv=None):
     a.add_argument("--cam-pitch-deg", type=float, default=0.0, help=">0 = tilted down")
     a.add_argument("--pose-port", type=int, default=None)
     a.add_argument("--signal-udp", default=None, help="host:port to send JSON signals")
+    a.add_argument("--log-dir", default="logs")
     a.add_argument("--state-file", default="survivors_state.json")
     a.add_argument("--resume", action="store_true", help="load --state-file at start")
     a.add_argument("--max-errors", type=int, default=50, help="consecutive frame errors")
@@ -452,7 +464,40 @@ def main():
         host, port = args.signal_udp.split(":")
         out_sock, out_addr = socket.socket(socket.AF_INET, socket.SOCK_DGRAM), (host, int(port))
 
-    def emit(sig):
+    run_dir = os.path.join(args.log_dir, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(os.path.join(run_dir, "snapshots"), exist_ok=True)
+    log_path = os.path.join(run_dir, "survivor_log.csv")
+    log_f = open(log_path, "w", newline="")
+    log_w = csv.writer(log_f)
+    log_w.writerow(["time_iso", "elapsed_s", "event", "survivor_id", "grid_i", "grid_j",
+                    "x_m", "y_m", "conf", "total_survivors", "snapshot"])
+    log_f.flush()
+    print(f"log: {log_path}", flush=True)
+
+    def emit(sig, frame=None, box=None):
+        snap = ""
+        if sig["event"] == "survivor" and frame is not None and box is not None:
+            img = frame.copy()
+            cv2.rectangle(img, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])),
+                          (0, 255, 0), 2)
+            cv2.putText(img, f"S{sig['id']} {sig['time_iso']}", (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            snap = os.path.join("snapshots", f"survivor_{sig['id']:02d}.jpg")
+            try:
+                cv2.imwrite(os.path.join(run_dir, snap), img)
+            except Exception as e:
+                print(f"WARNING: snapshot failed: {e}")
+        g = sig["grid"] or ("", "")
+        xy = sig["xy_m"] or ("", "")
+        try:
+            log_w.writerow([sig["time_iso"], sig["elapsed_s"], sig["event"], sig["id"],
+                            g[0], g[1], xy[0], xy[1], sig["conf"], sig["total"], snap])
+            log_f.flush()
+            os.fsync(log_f.fileno())
+        except (OSError, ValueError) as e:
+            print(f"WARNING: cannot write log: {e}")
+        if sig["event"] != "survivor":
+            return  # duplicates are logged only; no signal, no state change
         print(json.dumps(sig), flush=True)
         try:
             reg.save(args.state_file)
